@@ -4,7 +4,7 @@ Session-tied fixed-delay loops for OpenCode.
 
 ```json
 {
-  "plugin": ["opencode-loop"]
+  "plugin": ["@malico/opencode-loop"]
 }
 ```
 
