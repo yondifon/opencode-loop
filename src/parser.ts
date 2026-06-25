@@ -1,5 +1,5 @@
 export type LoopCommand =
-  | { type: "create"; intervalMs: number; prompt: string; intervalText: string }
+  | { type: "create"; intervalMs: number; prompt: string; intervalText: string; autoCompact?: boolean }
   | { type: "cancel"; target?: string }
   | { type: "status" }
   | { type: "list" }
@@ -52,7 +52,8 @@ export function parseInterval(input: string): { intervalMs: number; intervalText
 }
 
 export function parseLoopCommand(input: string): LoopCommand {
-  const text = input.trim()
+  const options = parseLoopOptions(input)
+  const text = options.text.trim()
   const normalized = text.toLowerCase().replace(/\s+/g, " ").trim()
 
   if (!normalized) return { type: "status" }
@@ -86,10 +87,33 @@ export function parseLoopCommand(input: string): LoopCommand {
       intervalMs: interval.intervalMs,
       prompt,
       intervalText: interval.intervalText,
+      autoCompact: options.autoCompact,
     }
   }
 
   return { type: "unknown", message: "Try `/loop every 5 mins check this`, `/loop status`, or `/loop cancel`." }
+}
+
+function parseLoopOptions(input: string) {
+  let autoCompact: boolean | undefined
+  const text = input
+    .replace(/(^|\s)--no-auto-compact\b/gi, (match, prefix: string) => {
+      autoCompact = false
+      return prefix
+    })
+    .replace(/(^|\s)--no-compact\b/gi, (match, prefix: string) => {
+      autoCompact = false
+      return prefix
+    })
+    .replace(/(^|\s)--auto-compact\b/gi, (match, prefix: string) => {
+      autoCompact = true
+      return prefix
+    })
+    .replace(/(^|\s)--compact\b/gi, (match, prefix: string) => {
+      autoCompact = true
+      return prefix
+    })
+  return { text, autoCompact }
 }
 
 export function formatDuration(ms: number): string {

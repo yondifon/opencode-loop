@@ -8,6 +8,17 @@ describe("parseLoopCommand", () => {
       intervalMs: 300_000,
       prompt: "check this",
       intervalText: "5 mins",
+      autoCompact: undefined,
+    })
+  })
+
+  test("parses auto-compact option", () => {
+    expect(parseLoopCommand("every 30 mins write article --auto-compact")).toEqual({
+      type: "create",
+      intervalMs: 1_800_000,
+      prompt: "write article",
+      intervalText: "30 mins",
+      autoCompact: true,
     })
   })
 

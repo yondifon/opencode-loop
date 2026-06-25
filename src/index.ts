@@ -13,6 +13,7 @@ type LoopRow = {
   sessionId: string
   prompt: string
   intervalMs: number
+  autoCompact: boolean
   status: LoopStatus
   createdAt: number
   updatedAt: number
@@ -48,6 +49,7 @@ type LoopPluginOptions = {
   commandName?: string
   dbPath?: string
   minIntervalMs?: number
+  autoCompact?: boolean
 }
 
 const MAX_TIMEOUT_MS = 2_147_483_647
@@ -96,6 +98,7 @@ function loopFromRow(row: any): LoopRow {
     sessionId: row.session_id,
     prompt: row.prompt,
     intervalMs: row.interval_ms,
+    autoCompact: Boolean(row.auto_compact),
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -152,13 +155,14 @@ class LoopStore {
     )
   }
 
-  createLoop(input: Pick<LoopRow, "sessionId" | "prompt" | "intervalMs">): LoopRow {
+  createLoop(input: Pick<LoopRow, "sessionId" | "prompt" | "intervalMs"> & { autoCompact?: boolean }): LoopRow {
     const timestamp = now()
     const loop: LoopRow = {
       id: makeId("loop"),
       sessionId: input.sessionId,
       prompt: input.prompt,
       intervalMs: input.intervalMs,
+      autoCompact: input.autoCompact ?? false,
       status: "active",
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -173,14 +177,15 @@ class LoopStore {
     this.db
       .query(
         `insert into loops
-          (id, session_id, prompt, interval_ms, status, created_at, updated_at, next_run_at, last_run_id, last_started_at, last_finished_at, run_count, lease_owner, lease_until)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id, session_id, prompt, interval_ms, auto_compact, status, created_at, updated_at, next_run_at, last_run_id, last_started_at, last_finished_at, run_count, lease_owner, lease_until)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         loop.id,
         loop.sessionId,
         loop.prompt,
         loop.intervalMs,
+        loop.autoCompact ? 1 : 0,
         loop.status,
         loop.createdAt,
         loop.updatedAt,
@@ -193,6 +198,12 @@ class LoopStore {
         loop.leaseUntil,
       )
     return loop
+  }
+
+  setAutoCompact(loopId: string, autoCompact: boolean): LoopRow | undefined {
+    const timestamp = now()
+    this.db.query("update loops set auto_compact = ?, updated_at = ? where id = ?").run(autoCompact ? 1 : 0, timestamp, loopId)
+    return this.getLoop(loopId)
   }
 
   createRun(loop: LoopRow, scheduledFor: number): RunRow {
@@ -249,6 +260,10 @@ class LoopStore {
 
   getActiveLoops(): LoopRow[] {
     return this.db.query("select * from loops where status = 'active'").all().map(loopFromRow)
+  }
+
+  getOpenLoops(): LoopRow[] {
+    return this.db.query("select * from loops where status in ('active', 'paused')").all().map(loopFromRow)
   }
 
   getRunningRuns(sessionId: string): RunRow[] {
@@ -382,6 +397,7 @@ class LoopStore {
         session_id text not null,
         prompt text not null,
         interval_ms integer not null,
+        auto_compact integer not null default 0,
         status text not null,
         created_at integer not null,
         updated_at integer not null,
@@ -417,6 +433,7 @@ class LoopStore {
     `)
     this.addColumnIfMissing("loops", "lease_owner", "text")
     this.addColumnIfMissing("loops", "lease_until", "integer")
+    this.addColumnIfMissing("loops", "auto_compact", "integer not null default 0")
   }
 
   recoverStaleRuns(): LoopRow[] {
@@ -492,6 +509,7 @@ function smartLoopPrompt(userText: string, commandName: string) {
     "",
     "Available actions:",
     "- Create a loop: call `loop_start` with `every` and `prompt`.",
+    "- If the user asks for compaction after each run, pass `autoCompact: true`.",
     "- Cancel loops: call `loop_cancel`.",
     "- Show status: call `loop_status`.",
     "- Resume paused loops: call `loop_resume`.",
@@ -499,6 +517,7 @@ function smartLoopPrompt(userText: string, commandName: string) {
     "Rules:",
     "- Loops are tied to the current session.",
     "- Fixed-delay semantics: next run starts interval after prior run finishes.",
+    "- Auto-compact means compact this session after each verified iteration.",
     "- If timing is unclear, ask one short clarification instead of guessing.",
     "- If task text is unclear, ask one short clarification instead of guessing.",
     `- Examples: \`/${commandName} remember every day to check this\` => every \"1 day\", prompt \"check this\".`,
@@ -531,8 +550,9 @@ function iterationPrompt(loop: LoopRow, run: RunRow) {
 }
 
 function formatLoop(loop: LoopRow) {
+  const autoCompact = loop.autoCompact ? "; auto-compact on" : ""
   return [
-    `- ${shortId(loop.id)} ${loop.status} every ${formatDuration(loop.intervalMs)}`,
+    `- ${shortId(loop.id)} ${loop.status} every ${formatDuration(loop.intervalMs)}${autoCompact}`,
     `  prompt: ${loop.prompt}`,
     `  runs: ${loop.runCount}; last start: ${iso(loop.lastStartedAt)}; last finish: ${iso(loop.lastFinishedAt)}`,
     `  next: ${iso(loop.nextRunAt)} (${relativeTime(loop.nextRunAt)})`,
@@ -578,6 +598,10 @@ function isIdleEvent(event: any) {
 
 function getSessionId(event: any) {
   return event?.properties?.sessionID || event?.properties?.info?.sessionID || event?.properties?.status?.sessionID
+}
+
+function isSessionDeletedEvent(event: any) {
+  return event?.type === "session.deleted"
 }
 
 function isBlocked(text: string) {
@@ -662,6 +686,39 @@ async function latestAssistantText(client: any, sessionId: string) {
   return ""
 }
 
+function modelFromMessage(message: any) {
+  const info = message?.info ?? message
+  const model = info?.model
+  if (typeof model?.providerID === "string" && typeof model?.modelID === "string") return model
+  if (typeof info?.providerID === "string" && typeof info?.modelID === "string") {
+    return { providerID: info.providerID, modelID: info.modelID }
+  }
+  return undefined
+}
+
+async function latestSessionModel(client: any, sessionId: string) {
+  const session = client.session
+  if (typeof session?.messages !== "function") throw new Error("OpenCode session messages API not found")
+  let messages: any[] = []
+  try {
+    const response = await session.messages({ path: { id: sessionId } })
+    messages = messagesFromResponse(response)
+  } catch (error) {
+    try {
+      const response = await session.messages({ sessionID: sessionId })
+      messages = messagesFromResponse(response)
+    } catch {
+      throw error
+    }
+  }
+
+  for (const message of [...messages].reverse()) {
+    const model = modelFromMessage(message)
+    if (model) return model
+  }
+  throw new Error("OpenCode session model not found")
+}
+
 async function abortSession(client: any, sessionId: string) {
   const session = client.session
   if (typeof session?.abort !== "function") return false
@@ -674,9 +731,21 @@ async function abortSession(client: any, sessionId: string) {
   }
 }
 
+async function compactSession(client: any, sessionId: string) {
+  const session = client.session
+  if (typeof session?.summarize !== "function") throw new Error("OpenCode session summarize API not found")
+  const model = await latestSessionModel(client, sessionId)
+  return assertNoSDKError(await session.summarize({ path: { id: sessionId }, body: model }))
+}
+
+function resolveAutoCompact(value: boolean | undefined, fallback: boolean) {
+  return value ?? fallback
+}
+
 export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions) => {
   const commandName = options?.commandName?.replace(/^\//, "") || "loop"
   const minIntervalMs = Math.max(1_000, options?.minIntervalMs ?? 1_000)
+  const defaultAutoCompact = options?.autoCompact ?? false
   const store = new LoopStore(options?.dbPath || defaultDbPath())
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
 
@@ -720,6 +789,20 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
     for (const loop of store.getSessionLoops(sessionId, true)) {
       if (loop.nextRunAt && loop.nextRunAt <= now()) scheduleLoop(loop)
     }
+  }
+
+  function cancelSessionLoops(sessionId: string, reason = "loop cancelled") {
+    const cancelled = store.cancelLoops(sessionId)
+    const cancelledRuns = store.cancelRunningRuns(cancelled, reason)
+    for (const loop of cancelled) clearLoopTimer(loop.id)
+    return { cancelled, cancelledRuns }
+  }
+
+  function cancelAllOpenLoops(reason = "opencode exited") {
+    const sessions = new Set(store.getOpenLoops().map((loop) => loop.sessionId))
+    const cancelled: LoopRow[] = []
+    for (const sessionId of sessions) cancelled.push(...cancelSessionLoops(sessionId, reason).cancelled)
+    return cancelled
   }
 
   async function startScheduledRun(loopId: string) {
@@ -778,22 +861,25 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
           prompt: tool.schema.string().describe("The task to run each iteration. Do not include the interval words."),
           every: tool.schema.string().optional().describe("Natural interval, e.g. '5 mins', '1 hour', 'daily', '1 day'."),
           intervalMs: tool.schema.number().optional().describe("Interval in milliseconds. Use only if already known."),
+          autoCompact: tool.schema.boolean().optional().describe("Compact this session after each verified iteration."),
         },
         async execute(args, context) {
           const interval = parseToolInterval(args.every, args.intervalMs)
           if (interval.intervalMs < minIntervalMs) return `Interval too short. Minimum is ${formatDuration(minIntervalMs)}.`
           const prompt = args.prompt.trim()
           if (!prompt) return "Missing loop prompt."
+          const autoCompact = resolveAutoCompact(args.autoCompact, defaultAutoCompact)
 
           const existing = store.findExistingLoop({ sessionId: context.sessionID, prompt, intervalMs: interval.intervalMs })
           if (existing) {
+            if (args.autoCompact !== undefined && existing.autoCompact !== autoCompact) store.setAutoCompact(existing.id, autoCompact)
             queueLoop(existing.id)
-            return `Loop ${shortId(existing.id)} already exists. Next iteration queued.`
+            return `Loop ${shortId(existing.id)} already exists. Next iteration queued.${autoCompact ? " Auto-compact on." : ""}`
           }
 
-          const loop = store.createLoop({ sessionId: context.sessionID, prompt, intervalMs: interval.intervalMs })
+          const loop = store.createLoop({ sessionId: context.sessionID, prompt, intervalMs: interval.intervalMs, autoCompact })
           queueLoop(loop.id)
-          return `Started loop ${shortId(loop.id)} every ${formatDuration(loop.intervalMs)}. First iteration will run when this session becomes idle.`
+          return `Started loop ${shortId(loop.id)} every ${formatDuration(loop.intervalMs)}${autoCompact ? " with auto-compact" : ""}. First iteration will run when this session becomes idle.`
         },
       }),
 
@@ -841,6 +927,7 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
     },
 
     dispose: async () => {
+      cancelAllOpenLoops("opencode exited")
       for (const timer of timers.values()) clearTimeout(timer)
       timers.clear()
       store.close()
@@ -859,6 +946,20 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
       const sessionId = input.sessionID
       const parsed = parseLoopCommand(input.arguments || "")
 
+      if (input.arguments?.trim().toLowerCase().match(/^(exit|quit|q)$/)) {
+        const { cancelled } = cancelSessionLoops(sessionId, "loop exited")
+        output.parts = [
+          makeTextPart(
+            commandResult(
+              cancelled.length
+                ? `Cancelled ${cancelled.length} loop(s) in this session: ${cancelled.map((loop) => shortId(loop.id)).join(", ")}.`
+                : "No active loops matched in this session.",
+            ),
+          ),
+        ]
+        return
+      }
+
       if (parsed.type === "unknown") {
         output.parts = [makeTextPart(smartLoopPrompt(input.arguments || "", commandName))]
         return
@@ -867,20 +968,6 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
       if (parsed.type === "status" || parsed.type === "list") {
         output.parts = [makeTextPart(commandResult(statusText(store, sessionId)))]
         return
-      }
-
-      if (input.arguments?.trim().toLowerCase().match(/^(exit|quit|q)$/)) {
-        const active = store.getSessionLoops(sessionId, true)
-        if (active.length) {
-          output.parts = [
-            makeTextPart(
-              commandResult(
-                `You have ${active.length} active loop(s) in this session: ${active.map((loop) => shortId(loop.id)).join(", ")}. Cancel them first with \`/loop cancel\`, or run \`/loop exit\` to quit anyway.`,
-              ),
-            ),
-          ]
-          return
-        }
       }
 
       if (parsed.type === "cancel") {
@@ -925,17 +1012,27 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
 
       const existing = store.findExistingLoop({ sessionId, prompt: parsed.prompt, intervalMs: parsed.intervalMs })
       if (existing) {
+        const autoCompact = resolveAutoCompact(parsed.autoCompact, existing.autoCompact)
+        if (parsed.autoCompact !== undefined && existing.autoCompact !== autoCompact) store.setAutoCompact(existing.id, autoCompact)
         queueLoop(existing.id)
-        output.parts = [makeTextPart(commandResult(`Loop ${shortId(existing.id)} already exists. Next iteration queued.`))]
+        output.parts = [makeTextPart(commandResult(`Loop ${shortId(existing.id)} already exists. Next iteration queued.${autoCompact ? " Auto-compact on." : ""}`))]
         return
       }
 
-      const loop = store.createLoop({ sessionId, prompt: parsed.prompt, intervalMs: parsed.intervalMs })
+      const autoCompact = resolveAutoCompact(parsed.autoCompact, defaultAutoCompact)
+      const loop = store.createLoop({ sessionId, prompt: parsed.prompt, intervalMs: parsed.intervalMs, autoCompact })
       queueLoop(loop.id)
-      output.parts = [makeTextPart(commandResult(`Started loop ${shortId(loop.id)} every ${formatDuration(loop.intervalMs)}. First iteration queued now.`))]
+      output.parts = [makeTextPart(commandResult(`Started loop ${shortId(loop.id)} every ${formatDuration(loop.intervalMs)}${autoCompact ? " with auto-compact" : ""}. First iteration queued now.`))]
     },
 
     event: async ({ event }) => {
+      if (isSessionDeletedEvent(event)) {
+        const sessionId = getSessionId(event)
+        if (!sessionId) return
+        cancelSessionLoops(sessionId, "session deleted")
+        return
+      }
+
       if (!isIdleEvent(event)) return
       const sessionId = getSessionId(event)
       if (!sessionId) return
@@ -990,7 +1087,15 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
         const finished = store.finishRun(run, "completed")
         const latest = store.getLoop(loop.id)
         if (!latest || latest.status !== "active") continue
-        scheduleLoop(store.scheduleNext(latest, finished.finishedAt ?? now()))
+        const scheduled = store.scheduleNext(latest, finished.finishedAt ?? now())
+        scheduleLoop(scheduled)
+        if (scheduled.autoCompact) {
+          try {
+            await compactSession(client, sessionId)
+          } catch (error) {
+            console.warn(`opencode-loop auto-compact failed for ${shortId(loop.id)}: ${error instanceof Error ? error.message : String(error)}`)
+          }
+        }
       }
       scheduleDueSessionLoops(sessionId)
     },

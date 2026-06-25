@@ -26,6 +26,7 @@ Usage:
 
 ```text
 /loop every 5 mins check this
+/loop every 30 mins write the next article section --auto-compact
 /loop remember every day to check this
 /loop status
 /loop cancel the current loops
@@ -36,6 +37,8 @@ Test locally with `make check`.
 Intervals are fixed-delay. If a 5 minute loop takes 10 minutes to run, the next run starts 5 minutes after it finishes.
 
 New loops queue their first iteration after the current session becomes idle. Completed iterations must include the run-specific `[loop:evidence:<run_id>]` marker requested by the plugin; missing evidence pauses the loop as `unverified`.
+
+Add `--auto-compact` to compact the session after each verified iteration.
 
 State is stored in `~/.config/opencode/loops/loops.db`. Loops are tied to OpenCode session IDs.
 
