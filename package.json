@@ -1,6 +1,6 @@
 {
   "name": "@malico/opencode-loop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Session-tied fixed-delay loops for OpenCode",
   "type": "module",
   "main": "dist/index.js",
@@ -27,6 +27,14 @@
     "automation"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yondifon/opencode-loop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yondifon/opencode-loop/issues"
+  },
+  "homepage": "https://github.com/yondifon/opencode-loop#readme",
   "dependencies": {
     "@opencode-ai/plugin": "^1.0.162"
   },

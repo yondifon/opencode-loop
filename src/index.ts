@@ -143,6 +143,15 @@ class LoopStore {
     this.db.close()
   }
 
+  findExistingLoop(input: Pick<LoopRow, "sessionId" | "prompt" | "intervalMs">): LoopRow | undefined {
+    const cleanPrompt = input.prompt.trim().toLowerCase().replace(/\s+/g, " ")
+    return this.getSessionLoops(input.sessionId, true).find(
+      (loop) =>
+        loop.intervalMs === input.intervalMs &&
+        loop.prompt.trim().toLowerCase().replace(/\s+/g, " ") === cleanPrompt,
+    )
+  }
+
   createLoop(input: Pick<LoopRow, "sessionId" | "prompt" | "intervalMs">): LoopRow {
     const timestamp = now()
     const loop: LoopRow = {
@@ -776,6 +785,12 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
           const prompt = args.prompt.trim()
           if (!prompt) return "Missing loop prompt."
 
+          const existing = store.findExistingLoop({ sessionId: context.sessionID, prompt, intervalMs: interval.intervalMs })
+          if (existing) {
+            queueLoop(existing.id)
+            return `Loop ${shortId(existing.id)} already exists. Next iteration queued.`
+          }
+
           const loop = store.createLoop({ sessionId: context.sessionID, prompt, intervalMs: interval.intervalMs })
           queueLoop(loop.id)
           return `Started loop ${shortId(loop.id)} every ${formatDuration(loop.intervalMs)}. First iteration will run when this session becomes idle.`
@@ -854,6 +869,20 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
         return
       }
 
+      if (input.arguments?.trim().toLowerCase().match(/^(exit|quit|q)$/)) {
+        const active = store.getSessionLoops(sessionId, true)
+        if (active.length) {
+          output.parts = [
+            makeTextPart(
+              commandResult(
+                `You have ${active.length} active loop(s) in this session: ${active.map((loop) => shortId(loop.id)).join(", ")}. Cancel them first with \`/loop cancel\`, or run \`/loop exit\` to quit anyway.`,
+              ),
+            ),
+          ]
+          return
+        }
+      }
+
       if (parsed.type === "cancel") {
         const cancelled = store.cancelLoops(sessionId, parsed.target)
         const cancelledRuns = store.cancelRunningRuns(cancelled)
@@ -891,6 +920,13 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
 
       if (parsed.intervalMs < minIntervalMs) {
         output.parts = [makeTextPart(commandResult(`Interval too short. Minimum is ${formatDuration(minIntervalMs)}.`))]
+        return
+      }
+
+      const existing = store.findExistingLoop({ sessionId, prompt: parsed.prompt, intervalMs: parsed.intervalMs })
+      if (existing) {
+        queueLoop(existing.id)
+        output.parts = [makeTextPart(commandResult(`Loop ${shortId(existing.id)} already exists. Next iteration queued.`))]
         return
       }
 
