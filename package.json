@@ -1,6 +1,6 @@
 {
   "name": "@malico/opencode-loop",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Session-tied fixed-delay loops for OpenCode",
   "type": "module",
   "main": "dist/index.js",
