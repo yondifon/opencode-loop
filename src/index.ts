@@ -12,8 +12,10 @@ type LoopRow = {
   id: string
   sessionId: string
   prompt: string
+  promptKey: string
   intervalMs: number
   autoCompact: boolean
+  runRequested: boolean
   status: LoopStatus
   createdAt: number
   updatedAt: number
@@ -42,6 +44,7 @@ type RunRow = {
 
 type LoopClaim = {
   loop: LoopRow
+  run: RunRow
   scheduledFor: number
 }
 
@@ -104,8 +107,10 @@ function loopFromRow(row: any): LoopRow {
     id: row.id,
     sessionId: row.session_id,
     prompt: row.prompt,
+    promptKey: row.prompt_key,
     intervalMs: row.interval_ms,
     autoCompact: Boolean(row.auto_compact),
+    runRequested: Boolean(row.run_requested),
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -146,28 +151,25 @@ class LoopStore {
     this.db.exec("PRAGMA busy_timeout = 5000")
     this.migrate()
     this.recoverStaleRuns()
-    this.ensureUniqueIndexes()
   }
 
   close() {
     this.db.close()
   }
 
-  findExistingLoop(input: Pick<LoopRow, "sessionId" | "prompt" | "intervalMs">): LoopRow | undefined {
-    const cleanPrompt = normalizeLoopPrompt(input.prompt)
-    return this.getSessionLoops(input.sessionId, true).find(
-      (loop) => loop.intervalMs === input.intervalMs && normalizeLoopPrompt(loop.prompt) === cleanPrompt,
-    )
-  }
-
-  createLoop(input: Pick<LoopRow, "sessionId" | "prompt" | "intervalMs"> & { autoCompact?: boolean }): LoopRow {
+  createOrGetLoop(
+    input: Pick<LoopRow, "sessionId" | "prompt" | "intervalMs"> & { autoCompact?: boolean },
+  ): { loop: LoopRow; created: boolean } {
     const timestamp = now()
+    const promptKey = normalizeLoopPrompt(input.prompt)
     const loop: LoopRow = {
       id: makeId("loop"),
       sessionId: input.sessionId,
       prompt: input.prompt,
+      promptKey,
       intervalMs: input.intervalMs,
       autoCompact: input.autoCompact ?? false,
+      runRequested: false,
       status: "active",
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -179,30 +181,39 @@ class LoopStore {
       leaseOwner: null,
       leaseUntil: null,
     }
-    this.db
-      .query(
-        `insert into loops
-          (id, session_id, prompt, interval_ms, auto_compact, status, created_at, updated_at, next_run_at, last_run_id, last_started_at, last_finished_at, run_count, lease_owner, lease_until)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        loop.id,
-        loop.sessionId,
-        loop.prompt,
-        loop.intervalMs,
-        loop.autoCompact ? 1 : 0,
-        loop.status,
-        loop.createdAt,
-        loop.updatedAt,
-        loop.nextRunAt,
-        loop.lastRunId,
-        loop.lastStartedAt,
-        loop.lastFinishedAt,
-        loop.runCount,
-        loop.leaseOwner,
-        loop.leaseUntil,
-      )
-    return loop
+    return this.transaction(() => {
+      const existing = this.db
+        .query("select * from loops where session_id = ? and prompt_key = ? and interval_ms = ? and status in ('active', 'paused') limit 1")
+        .get(input.sessionId, promptKey, input.intervalMs)
+      if (existing) return { loop: loopFromRow(existing), created: false }
+
+      this.db
+        .query(
+          `insert into loops
+            (id, session_id, prompt, prompt_key, interval_ms, auto_compact, run_requested, status, created_at, updated_at, next_run_at, last_run_id, last_started_at, last_finished_at, run_count, lease_owner, lease_until)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          loop.id,
+          loop.sessionId,
+          loop.prompt,
+          loop.promptKey,
+          loop.intervalMs,
+          loop.autoCompact ? 1 : 0,
+          0,
+          loop.status,
+          loop.createdAt,
+          loop.updatedAt,
+          loop.nextRunAt,
+          loop.lastRunId,
+          loop.lastStartedAt,
+          loop.lastFinishedAt,
+          loop.runCount,
+          loop.leaseOwner,
+          loop.leaseUntil,
+        )
+      return { loop, created: true }
+    })
   }
 
   setAutoCompact(loopId: string, autoCompact: boolean): LoopRow | undefined {
@@ -296,11 +307,11 @@ class LoopStore {
   }
 
   scheduleNext(loop: LoopRow, finishedAt: number): LoopRow {
-    const nextRunAt = finishedAt + loop.intervalMs
+    const nextRunAt = loop.runRequested ? finishedAt : finishedAt + loop.intervalMs
     const updatedAt = now()
     this.db
       .query(
-        "update loops set next_run_at = ?, last_finished_at = ?, run_count = run_count + 1, lease_owner = null, lease_until = null, updated_at = ? where id = ?",
+        "update loops set next_run_at = ?, run_requested = 0, last_finished_at = ?, run_count = run_count + 1, lease_owner = null, lease_until = null, updated_at = ? where id = ?",
       )
       .run(nextRunAt, finishedAt, updatedAt, loop.id)
     return { ...loop, nextRunAt, lastFinishedAt: finishedAt, runCount: loop.runCount + 1, leaseOwner: null, leaseUntil: null, updatedAt }
@@ -308,35 +319,68 @@ class LoopStore {
 
   setNextRunAt(loopId: string, nextRunAt: number): LoopRow | undefined {
     const timestamp = now()
-    this.db.query("update loops set next_run_at = ?, lease_owner = null, lease_until = null, updated_at = ? where id = ?").run(nextRunAt, timestamp, loopId)
+    this.db.query("update loops set next_run_at = ?, run_requested = 0, lease_owner = null, lease_until = null, updated_at = ? where id = ?").run(nextRunAt, timestamp, loopId)
     return this.getLoop(loopId)
   }
 
-  claimDueLoop(loopId: string, owner: string, leaseMs: number): LoopClaim | undefined {
+  postponeUnclaimedLoop(loopId: string, nextRunAt: number): LoopRow | undefined {
     const timestamp = now()
-    const loop = this.getLoop(loopId)
-    if (!loop || loop.status !== "active" || !loop.nextRunAt || loop.nextRunAt > timestamp) return undefined
-
-    const result = this.db
+    this.db
       .query(
         `update loops
-         set next_run_at = null, lease_owner = ?, lease_until = ?, updated_at = ?
+         set next_run_at = ?, run_requested = 0, updated_at = ?
          where id = ?
            and status = 'active'
-           and next_run_at is not null
-           and next_run_at <= ?
            and (lease_until is null or lease_until <= ?)
-           and not exists (
-             select 1 from loop_runs
-             where loop_runs.session_id = loops.session_id
-               and loop_runs.status = 'running'
-           )`,
+           and not exists (select 1 from loop_runs where loop_id = ? and status = 'running')`,
       )
-      .run(owner, timestamp + leaseMs, timestamp, loopId, timestamp, timestamp)
-    if (result.changes !== 1) return undefined
+      .run(nextRunAt, timestamp, loopId, timestamp, loopId)
+    return this.getLoop(loopId)
+  }
 
-    const claimed = this.getLoop(loopId)
-    return claimed ? { loop: claimed, scheduledFor: loop.nextRunAt } : undefined
+  requestRunNow(loopId: string): LoopRow | undefined {
+    const timestamp = now()
+    this.db
+      .query(
+        `update loops
+         set next_run_at = case when lease_owner is null then ? else next_run_at end,
+             run_requested = case when lease_owner is null then run_requested else 1 end,
+             updated_at = ?
+         where id = ? and status = 'active'`,
+      )
+      .run(timestamp, timestamp, loopId)
+    return this.getLoop(loopId)
+  }
+
+  claimDueRun(loopId: string, owner: string, leaseMs: number): LoopClaim | undefined {
+    return this.transaction(() => {
+      const timestamp = now()
+      const loop = this.getLoop(loopId)
+      if (!loop || loop.status !== "active" || !loop.nextRunAt || loop.nextRunAt > timestamp) return undefined
+
+      const result = this.db
+        .query(
+          `update loops
+           set next_run_at = null, lease_owner = ?, lease_until = ?, updated_at = ?
+           where id = ?
+             and status = 'active'
+             and next_run_at is not null
+             and next_run_at <= ?
+             and (lease_until is null or lease_until <= ?)
+             and not exists (
+               select 1 from loop_runs
+               where loop_runs.session_id = loops.session_id
+                 and loop_runs.status = 'running'
+             )`,
+        )
+        .run(owner, timestamp + leaseMs, timestamp, loopId, timestamp, timestamp)
+      if (result.changes !== 1) return undefined
+
+      const claimed = this.getLoop(loopId)
+      if (!claimed) throw new Error(`claimed loop ${loopId} disappeared`)
+      const run = this.createRun(claimed, loop.nextRunAt)
+      return { loop: claimed, run, scheduledFor: loop.nextRunAt }
+    })
   }
 
   releaseLease(loopId: string) {
@@ -347,21 +391,21 @@ class LoopStore {
   pauseLoop(loopId: string) {
     const timestamp = now()
     this.db
-      .query("update loops set status = 'paused', next_run_at = null, lease_owner = null, lease_until = null, updated_at = ? where id = ?")
+      .query("update loops set status = 'paused', next_run_at = null, run_requested = 0, lease_owner = null, lease_until = null, updated_at = ? where id = ?")
       .run(timestamp, loopId)
   }
 
   activateLoop(loopId: string) {
     const timestamp = now()
     this.db
-      .query("update loops set status = 'active', next_run_at = null, lease_owner = null, lease_until = null, updated_at = ? where id = ?")
+      .query("update loops set status = 'active', next_run_at = null, run_requested = 0, lease_owner = null, lease_until = null, updated_at = ? where id = ?")
       .run(timestamp, loopId)
   }
 
   cancelLoops(sessionId: string, target?: string): LoopRow[] {
     const loops = this.matchLoops(sessionId, target).filter((loop) => loop.status === "active" || loop.status === "paused")
     const timestamp = now()
-    const update = this.db.query("update loops set status = 'cancelled', next_run_at = null, lease_owner = null, lease_until = null, updated_at = ? where id = ?")
+    const update = this.db.query("update loops set status = 'cancelled', next_run_at = null, run_requested = 0, lease_owner = null, lease_until = null, updated_at = ? where id = ?")
     for (const loop of loops) update.run(timestamp, loop.id)
     return loops.map((loop) => ({ ...loop, status: "cancelled", nextRunAt: null, leaseOwner: null, leaseUntil: null, updatedAt: timestamp }))
   }
@@ -379,7 +423,7 @@ class LoopStore {
   resumeLoops(sessionId: string, target?: string): LoopRow[] {
     const loops = this.matchLoops(sessionId, target).filter((loop) => loop.status === "paused")
     const timestamp = now()
-    const update = this.db.query("update loops set status = 'active', next_run_at = null, lease_owner = null, lease_until = null, updated_at = ? where id = ?")
+    const update = this.db.query("update loops set status = 'active', next_run_at = null, run_requested = 0, lease_owner = null, lease_until = null, updated_at = ? where id = ?")
     for (const loop of loops) update.run(timestamp, loop.id)
     return loops.map((loop) => ({ ...loop, status: "active", nextRunAt: null, leaseOwner: null, leaseUntil: null, updatedAt: timestamp }))
   }
@@ -416,49 +460,73 @@ class LoopStore {
   }
 
   private migrate() {
-    this.db.exec(`
-      create table if not exists loops (
-        id text primary key,
-        session_id text not null,
-        prompt text not null,
-        interval_ms integer not null,
-        auto_compact integer not null default 0,
-        status text not null,
-        created_at integer not null,
-        updated_at integer not null,
-        next_run_at integer,
-        last_run_id text,
-        last_started_at integer,
-        last_finished_at integer,
-        run_count integer not null default 0,
-        lease_owner text,
-        lease_until integer
-      );
+    this.transaction(() => {
+      this.db.exec(`
+        create table if not exists loops (
+          id text primary key,
+          session_id text not null,
+          prompt text not null,
+          prompt_key text not null default '',
+          interval_ms integer not null,
+          auto_compact integer not null default 0,
+          run_requested integer not null default 0,
+          status text not null,
+          created_at integer not null,
+          updated_at integer not null,
+          next_run_at integer,
+          last_run_id text,
+          last_started_at integer,
+          last_finished_at integer,
+          run_count integer not null default 0,
+          lease_owner text,
+          lease_until integer
+        );
 
-      create index if not exists loops_session_status_idx on loops (session_id, status);
-      create index if not exists loops_next_run_idx on loops (next_run_at);
+        create index if not exists loops_session_status_idx on loops (session_id, status);
+        create index if not exists loops_next_run_idx on loops (next_run_at);
 
-      create table if not exists loop_runs (
-        id text primary key,
-        loop_id text not null,
-        session_id text not null,
-        scheduled_for integer not null,
-        started_at integer,
-        finished_at integer,
-        duration_ms integer,
-        status text not null,
-        error text,
-        created_at integer not null,
-        updated_at integer not null,
-        foreign key (loop_id) references loops(id) on delete cascade
-      );
+        create table if not exists loop_runs (
+          id text primary key,
+          loop_id text not null,
+          session_id text not null,
+          scheduled_for integer not null,
+          started_at integer,
+          finished_at integer,
+          duration_ms integer,
+          status text not null,
+          error text,
+          created_at integer not null,
+          updated_at integer not null,
+          foreign key (loop_id) references loops(id) on delete cascade
+        );
 
-      create index if not exists loop_runs_session_status_idx on loop_runs (session_id, status);
-      create index if not exists loop_runs_loop_created_idx on loop_runs (loop_id, created_at);
-    `)
-    this.addColumnIfMissing("loops", "lease_owner", "text")
-    this.addColumnIfMissing("loops", "lease_until", "integer")
-    this.addColumnIfMissing("loops", "auto_compact", "integer not null default 0")
+        create index if not exists loop_runs_session_status_idx on loop_runs (session_id, status);
+        create index if not exists loop_runs_loop_created_idx on loop_runs (loop_id, created_at);
+      `)
+      this.addColumnIfMissing("loops", "lease_owner", "text")
+      this.addColumnIfMissing("loops", "lease_until", "integer")
+      this.addColumnIfMissing("loops", "auto_compact", "integer not null default 0")
+      this.addColumnIfMissing("loops", "prompt_key", "text not null default ''")
+      this.addColumnIfMissing("loops", "run_requested", "integer not null default 0")
+
+      const loops = this.db.query("select id, prompt from loops").all() as Array<{ id: string; prompt: string }>
+      const updatePromptKey = this.db.query("update loops set prompt_key = ? where id = ?")
+      for (const loop of loops) updatePromptKey.run(normalizeLoopPrompt(loop.prompt), loop.id)
+      this.reconcileRunningRuns()
+      this.deduplicateLiveLoops()
+
+      this.db.exec(`
+        create unique index if not exists loops_one_live_identity_idx
+          on loops (session_id, prompt_key, interval_ms)
+          where status in ('active', 'paused');
+        create unique index if not exists loop_runs_one_running_loop_idx
+          on loop_runs (loop_id)
+          where status = 'running';
+        create unique index if not exists loop_runs_one_running_session_idx
+          on loop_runs (session_id)
+          where status = 'running';
+      `)
+    })
   }
 
   recoverStaleRuns(): LoopRow[] {
@@ -484,33 +552,85 @@ class LoopStore {
       .query(
         `update loops
          set next_run_at = ?, lease_owner = null, lease_until = null, updated_at = ?
-         where status = 'active'
-           and next_run_at is null
-           and not exists (
+          where status = 'active'
+            and next_run_at is null
+            and (lease_until is null or lease_until <= ?)
+            and not exists (
              select 1 from loop_runs
              where loop_runs.loop_id = loops.id
                and loop_runs.status = 'running'
            )`,
       )
-      .run(timestamp, timestamp)
+      .run(timestamp, timestamp, timestamp)
     return this.getActiveLoops()
   }
 
-  private ensureUniqueIndexes() {
-    this.db.exec(`
-      create unique index if not exists loop_runs_one_running_loop_idx
-        on loop_runs (loop_id)
-        where status = 'running';
-      create unique index if not exists loop_runs_one_running_session_idx
-        on loop_runs (session_id)
-        where status = 'running';
-    `)
+  private deduplicateLiveLoops() {
+    const loops = this.db
+      .query(
+        `select * from loops
+         where status in ('active', 'paused')
+         order by exists(select 1 from loop_runs where loop_runs.loop_id = loops.id and loop_runs.status = 'running') desc,
+                  case status when 'active' then 0 else 1 end, created_at, id`,
+      )
+      .all()
+      .map(loopFromRow)
+    const seen = new Set<string>()
+    const timestamp = now()
+    const cancel = this.db.query(
+      "update loops set status = 'cancelled', next_run_at = null, run_requested = 0, lease_owner = null, lease_until = null, updated_at = ? where id = ?",
+    )
+    for (const loop of loops) {
+      const key = `${loop.sessionId}\0${loop.promptKey}\0${loop.intervalMs}`
+      if (!seen.has(key)) {
+        seen.add(key)
+        continue
+      }
+      cancel.run(timestamp, loop.id)
+    }
+  }
+
+  private reconcileRunningRuns() {
+    const runs = this.db
+      .query("select * from loop_runs where status = 'running' order by started_at desc, id")
+      .all()
+      .map(runFromRow)
+    const loopIds = new Set<string>()
+    const sessionIds = new Set<string>()
+    const timestamp = now()
+    for (const run of runs) {
+      if (!loopIds.has(run.loopId) && !sessionIds.has(run.sessionId)) {
+        loopIds.add(run.loopId)
+        sessionIds.add(run.sessionId)
+        continue
+      }
+      this.db
+        .query("update loop_runs set status = 'failed', finished_at = ?, duration_ms = case when started_at is not null then ? - started_at else null end, error = ?, updated_at = ? where id = ?")
+        .run(timestamp, timestamp, "superseded during migration", timestamp, run.id)
+      if (!loopIds.has(run.loopId)) {
+        this.db
+          .query("update loops set next_run_at = ?, lease_owner = null, lease_until = null, updated_at = ? where id = ? and status = 'active'")
+          .run(timestamp, timestamp, run.loopId)
+      }
+    }
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string) {
     const columns = this.db.query(`pragma table_info(${table})`).all() as Array<{ name: string }>
     if (columns.some((item) => item.name === column)) return
     this.db.exec(`alter table ${table} add column ${column} ${definition}`)
+  }
+
+  private transaction<T>(callback: () => T): T {
+    this.db.exec("begin immediate")
+    try {
+      const result = callback()
+      this.db.exec("commit")
+      return result
+    } catch (error) {
+      this.db.exec("rollback")
+      throw error
+    }
   }
 }
 
@@ -623,7 +743,7 @@ function isIdleEvent(event: any) {
 }
 
 function getSessionId(event: any) {
-  return event?.properties?.sessionID || event?.properties?.info?.sessionID || event?.properties?.status?.sessionID
+  return event?.properties?.sessionID || event?.properties?.info?.sessionID || event?.properties?.info?.id || event?.properties?.status?.sessionID
 }
 
 function isSessionDeletedEvent(event: any) {
@@ -678,6 +798,16 @@ async function promptSession(client: any, sessionId: string, text: string) {
     }
   }
   throw new Error("OpenCode session prompt API not found")
+}
+
+async function sessionIsIdle(client: any, sessionId: string) {
+  const session = client.session
+  if (typeof session?.status !== "function") return true
+  const response = assertNoSDKError(await session.status()) as any
+  const data = response?.data ?? response
+  const statuses = data?.statuses ?? data
+  const status = statuses?.[sessionId]
+  return !status || status.type === "idle"
 }
 
 async function latestAssistantText(client: any, sessionId: string) {
@@ -771,6 +901,11 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
   const defaultAutoCompact = options?.autoCompact ?? false
   const store = new LoopStore(options?.dbPath || defaultDbPath())
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
+  const pendingRuns = new Set<Promise<void>>()
+  const eventWaiters: Array<() => void> = []
+  let activeEvents = 0
+  let disposing = false
+  let closed = false
 
   function clearLoopTimer(loopId: string) {
     const timer = timers.get(loopId)
@@ -779,9 +914,10 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
   }
 
   function scheduleLoop(loop: LoopRow) {
+    if (disposing || closed) return
     clearLoopTimer(loop.id)
     if (loop.status !== "active") return
-    const wakeAt = loop.nextRunAt ?? loop.leaseUntil
+    const wakeAt = loop.leaseUntil ?? loop.nextRunAt
     if (!wakeAt) return
     const delay = Math.max(0, wakeAt - now())
     const timer = setTimeout(
@@ -793,7 +929,7 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
           return
         }
         if (loop.nextRunAt) {
-          void startScheduledRun(loop.id)
+          trackRun(startScheduledRun(loop.id))
           return
         }
         for (const recovered of store.recoverStaleRuns()) scheduleLoop(recovered)
@@ -804,8 +940,19 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
   }
 
   function queueLoop(loopId: string) {
-    const queued = store.setNextRunAt(loopId, now())
+    const queued = store.requestRunNow(loopId)
+    if (queued) scheduleLoop(queued)
     return queued
+  }
+
+  function trackRun(run: Promise<void>) {
+    pendingRuns.add(run)
+    void run.finally(() => pendingRuns.delete(run))
+  }
+
+  async function waitForEvents() {
+    if (activeEvents === 0) return
+    await new Promise<void>((resolve) => eventWaiters.push(resolve))
   }
 
   function scheduleDueSessionLoops(sessionId: string) {
@@ -822,21 +969,35 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
   }
 
   async function startScheduledRun(loopId: string) {
+    if (disposing || closed) return
     const loop = store.getLoop(loopId)
     if (!loop || loop.status !== "active") return
 
-    if (store.getRunningRuns(loop.sessionId).length > 0) {
-      const postponed = store.setNextRunAt(loop.id, now() + SESSION_BUSY_RETRY_MS)
+    try {
+      if (!(await sessionIsIdle(client, loop.sessionId))) {
+        const postponed = store.postponeUnclaimedLoop(loop.id, now() + SESSION_BUSY_RETRY_MS)
+        if (postponed) scheduleLoop(postponed)
+        return
+      }
+    } catch (error) {
+      console.warn(`opencode-loop status check failed for ${shortId(loop.id)}: ${error instanceof Error ? error.message : String(error)}`)
+      const postponed = store.postponeUnclaimedLoop(loop.id, now() + SESSION_BUSY_RETRY_MS)
       if (postponed) scheduleLoop(postponed)
       return
     }
 
-    const claim = store.claimDueLoop(loop.id, instanceId, RUN_LEASE_MS)
+    if (store.getRunningRuns(loop.sessionId).length > 0) {
+      const postponed = store.postponeUnclaimedLoop(loop.id, now() + SESSION_BUSY_RETRY_MS)
+      if (postponed) scheduleLoop(postponed)
+      return
+    }
+
+    const claim = store.claimDueRun(loop.id, instanceId, RUN_LEASE_MS)
     if (!claim) {
       const latest = store.getLoop(loop.id)
       if (!latest || latest.status !== "active") return
       if (latest.nextRunAt && latest.nextRunAt <= now()) {
-        const postponed = store.setNextRunAt(latest.id, now() + SESSION_BUSY_RETRY_MS)
+        const postponed = store.postponeUnclaimedLoop(latest.id, now() + SESSION_BUSY_RETRY_MS)
         if (postponed) scheduleLoop(postponed)
         return
       }
@@ -844,9 +1005,8 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
       return
     }
 
-    let run: RunRow | undefined
+    const run = claim.run
     try {
-      run = store.createRun(claim.loop, claim.scheduledFor)
       await promptSession(client, claim.loop.sessionId, iterationPrompt(claim.loop, run))
       const latest = store.getLoop(claim.loop.id)
       // Keep a lease-expiry watchdog armed in case OpenCode never emits idle/error.
@@ -854,13 +1014,7 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const failedAt = now()
-      const failed = run ? store.finishRun(run, "failed", message) : undefined
-      if (!run) {
-        store.releaseLease(claim.loop.id)
-        const retry = store.setNextRunAt(claim.loop.id, failedAt + SESSION_BUSY_RETRY_MS)
-        if (retry) scheduleLoop(retry)
-        return
-      }
+      const failed = store.finishRun(run, "failed", message)
       const latest = store.getLoop(claim.loop.id)
       if (!latest || latest.status !== "active") return
       scheduleLoop(store.scheduleNext(latest, failed?.finishedAt ?? failedAt))
@@ -869,7 +1023,6 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
 
   for (const loop of store.getActiveLoops()) scheduleLoop(loop)
 
-  let closed = false
   const checkpoint = () => {
     if (closed) return
     store.checkpointForShutdown(instanceId)
@@ -894,14 +1047,19 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
           if (!prompt) return "Missing loop prompt."
           const autoCompact = resolveAutoCompact(args.autoCompact, defaultAutoCompact)
 
-          const existing = store.findExistingLoop({ sessionId: context.sessionID, prompt, intervalMs: interval.intervalMs })
-          if (existing) {
+          const result = store.createOrGetLoop({ sessionId: context.sessionID, prompt, intervalMs: interval.intervalMs, autoCompact })
+          if (!result.created) {
+            let existing = result.loop
+            if (existing.status === "paused") {
+              store.activateLoop(existing.id)
+              existing = store.getLoop(existing.id) ?? existing
+            }
             if (args.autoCompact !== undefined && existing.autoCompact !== autoCompact) store.setAutoCompact(existing.id, autoCompact)
             queueLoop(existing.id)
             return `Loop ${shortId(existing.id)} already exists. Next iteration queued.${autoCompact ? " Auto-compact on." : ""}`
           }
 
-          const loop = store.createLoop({ sessionId: context.sessionID, prompt, intervalMs: interval.intervalMs, autoCompact })
+          const loop = result.loop
           queueLoop(loop.id)
           return `Started loop ${shortId(loop.id)} every ${formatDuration(loop.intervalMs)}${autoCompact ? " with auto-compact" : ""}. First iteration will run when this session becomes idle.`
         },
@@ -966,10 +1124,13 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
 
     dispose: async () => {
       process.off("exit", checkpoint)
-      checkpoint()
-      closed = true
+      disposing = true
       for (const timer of timers.values()) clearTimeout(timer)
       timers.clear()
+      await Promise.allSettled([...pendingRuns])
+      await waitForEvents()
+      checkpoint()
+      closed = true
       store.close()
     },
 
@@ -1067,8 +1228,13 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
         return
       }
 
-      const existing = store.findExistingLoop({ sessionId, prompt: parsed.prompt, intervalMs: parsed.intervalMs })
-      if (existing) {
+      const result = store.createOrGetLoop({ sessionId, prompt: parsed.prompt, intervalMs: parsed.intervalMs, autoCompact: resolveAutoCompact(parsed.autoCompact, defaultAutoCompact) })
+      if (!result.created) {
+        let existing = result.loop
+        if (existing.status === "paused") {
+          store.activateLoop(existing.id)
+          existing = store.getLoop(existing.id) ?? existing
+        }
         const autoCompact = resolveAutoCompact(parsed.autoCompact, existing.autoCompact)
         if (parsed.autoCompact !== undefined && existing.autoCompact !== autoCompact) store.setAutoCompact(existing.id, autoCompact)
         queueLoop(existing.id)
@@ -1077,12 +1243,15 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
       }
 
       const autoCompact = resolveAutoCompact(parsed.autoCompact, defaultAutoCompact)
-      const loop = store.createLoop({ sessionId, prompt: parsed.prompt, intervalMs: parsed.intervalMs, autoCompact })
+      const loop = result.loop
       queueLoop(loop.id)
       output.parts = [makeTextPart(commandResult(`Started loop ${shortId(loop.id)} every ${formatDuration(loop.intervalMs)}${autoCompact ? " with auto-compact" : ""}. First iteration queued now.`))]
     },
 
     event: async ({ event }) => {
+      if (disposing || closed) return
+      activeEvents++
+      try {
       if (isSessionDeletedEvent(event)) {
         const sessionId = getSessionId(event)
         if (!sessionId) return
@@ -1134,9 +1303,16 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
           continue
         }
 
+        if (latestError) {
+          store.finishRun(run, "unverified", `could not inspect assistant response: ${latestError}`)
+          store.pauseLoop(loop.id)
+          clearLoopTimer(loop.id)
+          continue
+        }
+
         // Claude-parity: a finished turn IS a finished iteration. No evidence required.
         // Only an explicit blocked marker pauses the loop (model signalled it needs input).
-        if (!latestError && isBlocked(latestText)) {
+        if (isBlocked(latestText)) {
           store.finishRun(run, "blocked")
           store.pauseLoop(loop.id)
           clearLoopTimer(loop.id)
@@ -1157,6 +1333,12 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
         }
       }
       scheduleDueSessionLoops(sessionId)
+      } finally {
+        activeEvents--
+        if (activeEvents === 0) {
+          for (const resolve of eventWaiters.splice(0)) resolve()
+        }
+      }
     },
   }
 }

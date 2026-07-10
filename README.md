@@ -36,9 +36,9 @@ Test locally with `make check`.
 
 Intervals are fixed-delay. If a 5 minute loop takes 10 minutes to run, the next run starts 5 minutes after it finishes.
 
-New loops queue their first iteration after the current session becomes idle. Completed iterations must include the run-specific `[loop:evidence:<run_id>]` marker requested by the plugin; missing evidence pauses the loop as `unverified`.
+New loops queue their first iteration after OpenCode reports the current session idle. The run-specific `[loop:evidence:<run_id>]` marker is advisory; a finished turn completes the iteration. An explicit `[loop:blocked]` marker pauses the loop, while a response-inspection failure pauses it as `unverified`.
 
-Add `--auto-compact` to compact the session after each verified iteration.
+Add `--auto-compact` to compact the session after each completed iteration. Triggering `loop_now` during an active iteration queues one immediate follow-up run.
 
 State is stored in `~/.config/opencode/loops/loops.db`. Loops are tied to OpenCode session IDs.
 
