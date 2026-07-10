@@ -55,8 +55,6 @@ type LoopPluginOptions = {
 const MAX_TIMEOUT_MS = 2_147_483_647
 const SESSION_BUSY_RETRY_MS = 10_000
 const RUN_LEASE_MS = 6 * 60 * 60 * 1_000
-const INSTANCE_ID = makeId("instance")
-
 function now() {
   return Date.now()
 }
@@ -262,10 +260,6 @@ class LoopStore {
     return this.db.query("select * from loops where status = 'active'").all().map(loopFromRow)
   }
 
-  getOpenLoops(): LoopRow[] {
-    return this.db.query("select * from loops where status in ('active', 'paused')").all().map(loopFromRow)
-  }
-
   getRunningRuns(sessionId: string): RunRow[] {
     return this.db
       .query("select * from loop_runs where session_id = ? and status = 'running' order by started_at")
@@ -381,6 +375,30 @@ class LoopStore {
     const update = this.db.query("update loops set status = 'active', next_run_at = null, lease_owner = null, lease_until = null, updated_at = ? where id = ?")
     for (const loop of loops) update.run(timestamp, loop.id)
     return loops.map((loop) => ({ ...loop, status: "active", nextRunAt: null, leaseOwner: null, leaseUntil: null, updatedAt: timestamp }))
+  }
+
+  findLoops(sessionId: string, target?: string, activeOnly = false): LoopRow[] {
+    const loops = this.getSessionLoops(sessionId, activeOnly)
+    const clean = target?.trim().toLowerCase()
+    if (!clean || clean === "all" || clean === "current" || clean === "current loops") return loops
+    return loops.filter((loop) => loop.id.toLowerCase().includes(clean) || shortId(loop.id).includes(clean) || loop.prompt.toLowerCase().includes(clean))
+  }
+
+  checkpointForShutdown(owner: string) {
+    const timestamp = now()
+    this.db
+      .query(
+        `update loop_runs
+         set status = 'failed', finished_at = ?, duration_ms = case when started_at is not null then ? - started_at else null end, error = ?, updated_at = ?
+         where status = 'running'
+           and loop_id in (select id from loops where lease_owner = ?)`,
+      )
+      .run(timestamp, timestamp, "opencode exited mid-run", timestamp, owner)
+    this.db
+      .query(
+        "update loops set lease_owner = null, lease_until = null, next_run_at = coalesce(next_run_at, ?), updated_at = ? where status = 'active' and lease_owner = ?",
+      )
+      .run(timestamp, timestamp, owner)
   }
 
   private matchLoops(sessionId: string, target?: string): LoopRow[] {
@@ -513,6 +531,7 @@ function smartLoopPrompt(userText: string, commandName: string) {
     "- Cancel loops: call `loop_cancel`.",
     "- Show status: call `loop_status`.",
     "- Resume paused loops: call `loop_resume`.",
+    "- Run an iteration now, skipping the remaining wait: call `loop_now`.",
     "",
     "Rules:",
     "- Loops are tied to the current session.",
@@ -544,8 +563,8 @@ function iterationPrompt(loop: LoopRow, run: RunRow) {
     "Run exactly one iteration of this recurring loop.",
     "The plugin schedules the next iteration after this turn finishes; do not schedule it yourself.",
     "Use current project/session context. Verify actual state before claiming success.",
-    `If this iteration completes, include \`[loop:evidence:${run.id}]\` near the end with brief proof.`,
-    "If user input is required, explain the blocker and end with `[loop:blocked]`; the plugin will pause this loop.",
+    `End the turn with \`[loop:evidence:${run.id}]\` plus a one-line proof of what this iteration did. The marker is for readability only; finishing the turn completes the iteration whether or not it is present.`,
+    "Only if you cannot proceed without user input, explain the blocker and end with `[loop:blocked]`; the plugin will pause this loop until resumed.",
   ].join("\n")
 }
 
@@ -604,16 +623,12 @@ function isSessionDeletedEvent(event: any) {
   return event?.type === "session.deleted"
 }
 
+function isSessionErrorEvent(event: any) {
+  return event?.type === "session.error"
+}
+
 function isBlocked(text: string) {
   return /(^|\n)\s*(?:\[loop:blocked\]|loop:blocked)\s*$/i.test(text.trimEnd())
-}
-
-function escapeRegExp(text: string) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-}
-
-function hasEvidence(text: string, run: RunRow) {
-  return new RegExp(`\\[loop:evidence:${escapeRegExp(run.id)}\\]`, "i").test(text)
 }
 
 function sdkErrorMessage(response: any) {
@@ -743,6 +758,7 @@ function resolveAutoCompact(value: boolean | undefined, fallback: boolean) {
 }
 
 export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions) => {
+  const instanceId = makeId("instance")
   const commandName = options?.commandName?.replace(/^\//, "") || "loop"
   const minIntervalMs = Math.max(1_000, options?.minIntervalMs ?? 1_000)
   const defaultAutoCompact = options?.autoCompact ?? false
@@ -798,13 +814,6 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
     return { cancelled, cancelledRuns }
   }
 
-  function cancelAllOpenLoops(reason = "opencode exited") {
-    const sessions = new Set(store.getOpenLoops().map((loop) => loop.sessionId))
-    const cancelled: LoopRow[] = []
-    for (const sessionId of sessions) cancelled.push(...cancelSessionLoops(sessionId, reason).cancelled)
-    return cancelled
-  }
-
   async function startScheduledRun(loopId: string) {
     const loop = store.getLoop(loopId)
     if (!loop || loop.status !== "active") return
@@ -815,7 +824,7 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
       return
     }
 
-    const claim = store.claimDueLoop(loop.id, INSTANCE_ID, RUN_LEASE_MS)
+    const claim = store.claimDueLoop(loop.id, instanceId, RUN_LEASE_MS)
     if (!claim) {
       const latest = store.getLoop(loop.id)
       if (!latest || latest.status !== "active") return
@@ -833,7 +842,8 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
       run = store.createRun(claim.loop, claim.scheduledFor)
       await promptSession(client, claim.loop.sessionId, iterationPrompt(claim.loop, run))
       const latest = store.getLoop(claim.loop.id)
-      if (latest?.nextRunAt) scheduleLoop(latest)
+      // Keep a lease-expiry watchdog armed in case OpenCode never emits idle/error.
+      if (latest) scheduleLoop(latest)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const failedAt = now()
@@ -851,6 +861,13 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
   }
 
   for (const loop of store.getActiveLoops()) scheduleLoop(loop)
+
+  let closed = false
+  const checkpoint = () => {
+    if (closed) return
+    store.checkpointForShutdown(instanceId)
+  }
+  process.once("exit", checkpoint)
 
   return {
     tool: {
@@ -924,10 +941,26 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
           return `Resumed ${resumed.length} loop(s). Next iteration will run when this session becomes idle.`
         },
       }),
+
+      loop_now: tool({
+        description:
+          "Immediately queue the next iteration of an active loop in the current session, skipping the remaining wait, when the user asks to run/trigger/pick up the loop now.",
+        args: {
+          target: tool.schema.string().optional().describe("Optional loop short id or prompt text. Omit to trigger all active current session loops."),
+        },
+        async execute(args, context) {
+          const loops = store.findLoops(context.sessionID, args.target, true)
+          if (!loops.length) return "No active loops matched in this session."
+          for (const loop of loops) queueLoop(loop.id)
+          return `Triggering ${loops.length} loop(s) now: ${loops.map((loop) => shortId(loop.id)).join(", ")}. Next iteration runs when this session becomes idle.`
+        },
+      }),
     },
 
     dispose: async () => {
-      cancelAllOpenLoops("opencode exited")
+      process.off("exit", checkpoint)
+      checkpoint()
+      closed = true
       for (const timer of timers.values()) clearTimeout(timer)
       timers.clear()
       store.close()
@@ -1005,6 +1038,23 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
         return
       }
 
+      if (parsed.type === "now") {
+        const loops = store.findLoops(sessionId, parsed.target, true)
+        if (!loops.length) {
+          output.parts = [makeTextPart(commandResult("No active loops matched in this session."))]
+          return
+        }
+        for (const loop of loops) queueLoop(loop.id)
+        output.parts = [
+          makeTextPart(
+            commandResult(
+              `Triggering ${loops.length} loop(s) now: ${loops.map((loop) => shortId(loop.id)).join(", ")}. Next iteration runs when this session becomes idle.`,
+            ),
+          ),
+        ]
+        return
+      }
+
       if (parsed.intervalMs < minIntervalMs) {
         output.parts = [makeTextPart(commandResult(`Interval too short. Minimum is ${formatDuration(minIntervalMs)}.`))]
         return
@@ -1030,6 +1080,20 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
         const sessionId = getSessionId(event)
         if (!sessionId) return
         cancelSessionLoops(sessionId, "session deleted")
+        return
+      }
+
+      if (isSessionErrorEvent(event)) {
+        const sessionId = getSessionId(event)
+        if (!sessionId) return
+        const message = sdkErrorMessage(event.properties) || "OpenCode session error"
+        for (const run of store.getRunningRuns(sessionId)) {
+          store.finishRun(run, "failed", message)
+          const loop = store.getLoop(run.loopId)
+          if (!loop || loop.status !== "active") continue
+          const retry = store.setNextRunAt(loop.id, now() + SESSION_BUSY_RETRY_MS)
+          if (retry) scheduleLoop(retry)
+        }
         return
       }
 
@@ -1063,22 +1127,10 @@ export const LoopPlugin: Plugin = async ({ client }, options?: LoopPluginOptions
           continue
         }
 
-        if (latestError) {
-          store.finishRun(run, "unverified", `could not inspect assistant response: ${latestError}`)
-          store.pauseLoop(loop.id)
-          clearLoopTimer(loop.id)
-          continue
-        }
-
-        if (isBlocked(latestText)) {
+        // Claude-parity: a finished turn IS a finished iteration. No evidence required.
+        // Only an explicit blocked marker pauses the loop (model signalled it needs input).
+        if (!latestError && isBlocked(latestText)) {
           store.finishRun(run, "blocked")
-          store.pauseLoop(loop.id)
-          clearLoopTimer(loop.id)
-          continue
-        }
-
-        if (!hasEvidence(latestText, run)) {
-          store.finishRun(run, "unverified", `missing [loop:evidence:${run.id}] marker`)
           store.pauseLoop(loop.id)
           clearLoopTimer(loop.id)
           continue

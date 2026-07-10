@@ -29,6 +29,20 @@ describe("parseLoopCommand", () => {
   test("parses status default", () => {
     expect(parseLoopCommand("")).toEqual({ type: "status" })
   })
+
+  test("parses run-now verb without target", () => {
+    expect(parseLoopCommand("now")).toEqual({ type: "now", target: undefined })
+    expect(parseLoopCommand("run next")).toEqual({ type: "now", target: undefined })
+    expect(parseLoopCommand("pick up next")).toEqual({ type: "now", target: undefined })
+  })
+
+  test("parses run-now verb with target", () => {
+    expect(parseLoopCommand("now deploy")).toEqual({ type: "now", target: "deploy" })
+  })
+
+  test("does not treat a run-prefixed create command as run-now", () => {
+    expect(parseLoopCommand("run every 1 hour report")).toMatchObject({ type: "create" })
+  })
 })
 
 describe("parseInterval", () => {

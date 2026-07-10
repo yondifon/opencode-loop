@@ -4,6 +4,7 @@ export type LoopCommand =
   | { type: "status" }
   | { type: "list" }
   | { type: "resume"; target?: string }
+  | { type: "now"; target?: string }
   | { type: "unknown"; message: string }
 
 const UNIT_MS: Record<string, number> = {
@@ -71,6 +72,9 @@ export function parseLoopCommand(input: string): LoopCommand {
 
   const resumeMatch = normalized.match(/^(?:resume|restart)\b(?:\s+(?:the\s+)?(?:current\s+)?loops?)?(?:\s+(.+))?$/)
   if (resumeMatch) return { type: "resume", target: resumeMatch[1]?.trim() }
+
+  const nowMatch = normalized.match(/^(?:now|run now|run next|next now|run it now|trigger(?: now)?|fire(?: now)?|pick ?up(?: next)?)\b(?:\s+(?:the\s+)?(?:current\s+)?loops?)?(?:\s+(.+))?$/)
+  if (nowMatch) return { type: "now", target: nowMatch[1]?.trim() }
 
   const createMatch = text.match(
     /^\s*(?:create\s+|start\s+|run\s+)?(?:a\s+)?(?:loop\s+)?every\s+(\d+(?:\.\d+)?)\s*([a-zA-Z]+)\b\s*(?:to\s+)?([\s\S]+?)\s*$/i,
