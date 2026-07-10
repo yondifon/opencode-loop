@@ -90,6 +90,15 @@ function ensureParent(path: string) {
   if (!existsSync(parent)) mkdirSync(parent, { recursive: true, mode: 0o700 })
 }
 
+function normalizeLoopPrompt(prompt: string) {
+  return prompt
+    .trim()
+    .toLowerCase()
+    .replace(/^[.,;:!?]+\s*/, "")
+    .replace(/["'`]/g, "")
+    .replace(/\s+/g, " ")
+}
+
 function loopFromRow(row: any): LoopRow {
   return {
     id: row.id,
@@ -145,11 +154,9 @@ class LoopStore {
   }
 
   findExistingLoop(input: Pick<LoopRow, "sessionId" | "prompt" | "intervalMs">): LoopRow | undefined {
-    const cleanPrompt = input.prompt.trim().toLowerCase().replace(/\s+/g, " ")
+    const cleanPrompt = normalizeLoopPrompt(input.prompt)
     return this.getSessionLoops(input.sessionId, true).find(
-      (loop) =>
-        loop.intervalMs === input.intervalMs &&
-        loop.prompt.trim().toLowerCase().replace(/\s+/g, " ") === cleanPrompt,
+      (loop) => loop.intervalMs === input.intervalMs && normalizeLoopPrompt(loop.prompt) === cleanPrompt,
     )
   }
 
